@@ -87,3 +87,101 @@ function events(){sync();return records.filter(r=>/^\d{4}-\d{2}-\d{2}$/.test(r.d
 const icsEscape=s=>String(s).replace(/\\/g,'\\\\').replace(/\n/g,'\\n').replace(/,/g,'\\,').replace(/;/g,'\\;');
 $('ics').onclick=()=>{const list=events();if(!list.length){$('exportStatus').textContent='有効な日付と献立を入力してください。';return}let text='BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Kondate Calendar//JP\r\nCALSCALE:GREGORIAN\r\n';for(const r of list){const dt=r.date.replace(/-/g,'');const end=new Date(r.date+'T12:00:00');end.setDate(end.getDate()+1);const dtEnd=`${end.getFullYear()}${pad(end.getMonth()+1)}${pad(end.getDate())}`;text+=`BEGIN:VEVENT\r\nUID:${dt}-${Math.random().toString(36).slice(2)}@kondate-calendar\r\nDTSTAMP:${new Date().toISOString().replace(/[-:]/g,'').replace(/\.\d{3}/,'')}\r\nDTSTART;VALUE=DATE:${dt}\r\nDTEND;VALUE=DATE:${dtEnd}\r\nSUMMARY:${icsEscape(menuTitle(r.menu))}\r\nDESCRIPTION:${icsEscape(r.menu)}\r\nEND:VEVENT\r\n`}text+='END:VCALENDAR\r\n';const blob=new Blob([text],{type:'text/calendar;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`kondate-${$('year').value}-${pad($('month').value)}.ics`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);$('exportStatus').textContent=`${list.length}件のカレンダーファイルを作成しました。Googleカレンダーのパソコン版で取り込めます。`};
 render();
+
+const GOOGLE_CLIENT_ID='763783247877-5q5kcvanaqhfh82iq1169alr66ferkq4.apps.googleusercontent.com';
+const GOOGLE_SCOPE='https://www.googleapis.com/auth/calendar.events.owned https://www.googleapis.com/auth/userinfo.email';
+let googleSession=null, googleBusy=false;
+const googleButton=$('google');
+const authBox=document.createElement('div');
+authBox.innerHTML='<label for="sourceLabel">献立の区分（学校・園など）</label><input id="sourceLabel" type="text" value="学校" maxlength="60"><p class="muted">同じ区分・日付・献立は再登録しません。区分や献立を変更すると別の予定になります。以前にICSや別アプリで登録した予定との重複は判定できません。</p><button id="connectGoogle" class="btn secondary wide">Googleアカウントを選ぶ</button><p id="googleAccount" class="status" role="status">未接続</p><button id="disconnectGoogle" class="btn secondary small hidden">接続を解除</button>';
+googleButton.before(authBox);
+const connectButton=$('connectGoogle');
+function resetGoogle(){
+ googleSession=null; googleButton.disabled=true;
+ $('googleAccount').textContent='未接続';
+ $('disconnectGoogle').classList.add('hidden');
+}
+function validGoogleDate(date){
+ const d=new Date(date+'T00:00:00Z');
+ return /^\d{4}-\d{2}-\d{2}$/.test(date)&&!isNaN(d)&&d.toISOString().slice(0,10)===date;
+}
+function googleEndDate(date){
+ const d=new Date(date+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+1);return d.toISOString().slice(0,10);
+}
+async function googleEventId(source,row){
+ const bytes=new TextEncoder().encode(JSON.stringify(['kondate-v1',source.normalize('NFKC').trim(),row.date,clean(row.menu).normalize('NFKC')]));
+ return 'kc'+Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');
+}
+function loadGoogleIdentity(){
+ return new Promise((resolve,reject)=>{
+  if(window.google?.accounts?.oauth2){resolve();return}
+  const script=document.createElement('script');script.src='https://accounts.google.com/gsi/client';script.async=true;
+  script.onload=resolve;script.onerror=()=>reject(Error('Googleログインを読み込めませんでした。通信やブラウザの設定を確認してください。'));
+  document.head.append(script);
+ });
+}
+connectButton.disabled=true;
+loadGoogleIdentity().then(()=>{connectButton.disabled=false}).catch(err=>{$('googleAccount').textContent=err.message});
+connectButton.onclick=()=>{
+ resetGoogle();
+ const client=window.google.accounts.oauth2.initTokenClient({
+  client_id:GOOGLE_CLIENT_ID,scope:GOOGLE_SCOPE,include_granted_scopes:false,
+  error_callback:()=>{$('googleAccount').textContent='ログイン画面が閉じられたか開けませんでした。もう一度お試しください。'},
+  callback:async response=>{
+   if(response.error){$('googleAccount').textContent='接続できませんでした：'+response.error;return}
+   if(!window.google.accounts.oauth2.hasGrantedAllScopes(response,...GOOGLE_SCOPE.split(' '))){
+    $('googleAccount').textContent='登録に必要な権限が許可されていません。再度アカウントを選んで確認してください。';return;
+   }
+   try{
+    const res=await fetch('https://www.googleapis.com/oauth2/v2/userinfo',{headers:{Authorization:'Bearer '+response.access_token}});
+    if(!res.ok)throw Error('アカウント情報を確認できませんでした。');
+    const info=await res.json();if(!info.email)throw Error('メールアドレスを確認できませんでした。');
+    googleSession={token:response.access_token,email:info.email,expires:Date.now()+Number(response.expires_in||3600)*1000};
+    $('googleAccount').textContent='登録先：'+info.email+' のメインカレンダー';
+    googleButton.disabled=false;$('disconnectGoogle').classList.remove('hidden');
+   }catch(err){resetGoogle();$('googleAccount').textContent=err.message}
+  }
+ });
+ client.requestAccessToken({prompt:'select_account'});
+};
+$('disconnectGoogle').onclick=()=>{
+ if(googleBusy)return;
+ const token=googleSession?.token;resetGoogle();
+ if(token)window.google.accounts.oauth2.revoke(token,()=>{});
+};
+googleButton.textContent='確認した献立をGoogleカレンダーに一括登録';
+googleButton.onclick=async()=>{
+ if(googleBusy)return;
+ if(!googleSession||Date.now()>=googleSession.expires-30000){resetGoogle();$('exportStatus').textContent='Googleアカウントをもう一度選んでください。';return}
+ sync();
+ if(records.some(r=>!validGoogleDate(r.date)||!clean(r.menu))){$('exportStatus').textContent='日付が存在しない行や、献立が空の行を修正・削除してください。';return}
+ const list=events().map(r=>({...r})), source=clean($('sourceLabel').value);
+ if(!source){$('exportStatus').textContent='献立の区分を入力してください。';return}
+ if(!list.length){$('exportStatus').textContent='登録対象の献立がありません。';return}
+ const session={...googleSession};
+ if(!window.confirm('登録先：'+session.email+' のメインカレンダー\n区分：'+source+'\n'+list.length+'件を終日の予定として追加します。\n年月・献立を確認しましたか？'))return;
+ googleBusy=true;googleButton.disabled=true;connectButton.disabled=true;$('disconnectGoogle').disabled=true;
+ let added=0,skipped=0,failed=0,processed=0,reason='';
+ try{
+  for(const row of list){
+   if(Date.now()>=session.expires-30000){reason='接続の有効期限が切れました。再接続して再実行してください。';break}
+   const body={id:await googleEventId(source,row),summary:menuTitle(row.menu),description:row.menu+'\n\n献立の区分：'+source,start:{date:row.date},end:{date:googleEndDate(row.date)},extendedProperties:{private:{app:'kondate-calendar',source}}};
+   let res;
+   try{res=await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events',{method:'POST',headers:{Authorization:'Bearer '+session.token,'Content-Type':'application/json'},body:JSON.stringify(body)})}
+   catch{reason='通信が途切れました。結果不明の予定も含め、再実行すると重複を防いで再試行できます。';break}
+   processed++;
+   if(res.ok)added++;
+   else if(res.status===409)skipped++;
+   else{
+    failed++;reason='Googleへの登録に失敗しました（HTTP '+res.status+'）。';
+    if(res.status===401){resetGoogle();reason+=' 再接続してください。';break}
+    if(res.status===403||res.status===429)break;
+   }
+   $('exportStatus').textContent=processed+' / '+list.length+'件を処理中…';
+  }
+ }catch{reason='登録を中断しました。再実行して残りを登録できます。'}
+ finally{
+  googleBusy=false;connectButton.disabled=false;$('disconnectGoogle').disabled=false;googleButton.disabled=!googleSession;
+  $('exportStatus').textContent='追加'+added+'件／登録済み'+skipped+'件／失敗'+failed+'件／未処理'+(list.length-processed)+'件'+(reason?'\n'+reason:'');
+ }
+};
