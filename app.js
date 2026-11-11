@@ -112,6 +112,27 @@ async function googleEventId(source,row){
  const bytes=new TextEncoder().encode(JSON.stringify(['kondate-v1',source.normalize('NFKC').trim(),row.date,clean(row.menu).normalize('NFKC')]));
  return 'kc'+Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');
 }
+
+async function insertGoogleMeal(session,body){
+ const root='https://www.googleapis.com/calendar/v3/calendars/primary/events';
+ const headers={Authorization:'Bearer '+session.token,'Content-Type':'application/json'};
+ // Deleted event IDs remain reserved. Use a deterministic next generation only
+ // after Google confirms deletion, so retries and concurrent tabs use the same ID.
+ for(let generation=0;generation<100;generation++){
+  const id=body.id+(generation?'r'+generation.toString(32):'');
+  const inserted=await fetch(root,{method:'POST',headers,body:JSON.stringify({...body,id})});
+  if(inserted.status!==409)return inserted;
+  const existing=await fetch(root+'/'+encodeURIComponent(id),{headers:{Authorization:headers.Authorization}});
+  if(existing.status===410)continue;
+  if(!existing.ok)return existing; // An unreadable conflict is not a duplicate.
+  const event=await existing.json();
+  if(event.status==='cancelled')continue;
+  if(event.status==='confirmed'||event.status==='tentative')return inserted;
+  return {ok:false,status:502};
+ }
+ return {ok:false,status:409,conflictUnresolved:true};
+}
+
 function loadGoogleIdentity(){
  return new Promise((resolve,reject)=>{
   if(window.google?.accounts?.oauth2){resolve();return}
@@ -167,11 +188,11 @@ googleButton.onclick=async()=>{
    if(Date.now()>=session.expires-30000){reason='接続の有効期限が切れました。再接続して再実行してください。';break}
    const body={id:await googleEventId(source,row),summary:menuTitle(row.menu),description:row.menu+'\n\n献立の区分：'+source,start:{date:row.date},end:{date:googleEndDate(row.date)},extendedProperties:{private:{app:'kondate-calendar',source}}};
    let res;
-   try{res=await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events',{method:'POST',headers:{Authorization:'Bearer '+session.token,'Content-Type':'application/json'},body:JSON.stringify(body)})}
+   try{res=await insertGoogleMeal(session,body)}
    catch{reason='通信が途切れました。結果不明の予定も含め、再実行すると重複を防いで再試行できます。';break}
    processed++;
    if(res.ok)added++;
-   else if(res.status===409)skipped++;
+   else if(res.status===409&&!res.conflictUnresolved)skipped++;
    else{
     failed++;reason='Googleへの登録に失敗しました（HTTP '+res.status+'）。';
     if(res.status===401){resetGoogle();reason+=' 再接続してください。';break}
